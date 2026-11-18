@@ -209,6 +209,21 @@ section.active{display:block;}
   font-family:'Syne',sans-serif;font-size:0.7rem;font-weight:800;letter-spacing:0.08em;
   box-shadow:0 4px 16px rgba(0,212,255,0.4);}
 
+.input-error{display:none;margin-top:10px;font-size:0.78rem;color:#ff7b7b;
+  background:var(--red-glow);border:1px solid rgba(255,68,68,0.25);
+  border-radius:8px;padding:9px 13px;line-height:1.55;}
+.input-error.show{display:block;}
+.result-box + .result-box{margin-top:14px;}
+.result-stack{display:none;margin-top:1.2rem;}
+.result-stack.show{display:block;}
+.result-stack .result-box{display:block;margin-top:0;}
+.result-stack .result-box + .result-box{margin-top:14px;}
+.result-icon.unknown{background:var(--yellow-glow);border:1px solid rgba(255,204,0,0.25);}
+.result-title.unknown{color:var(--yellow);}
+.scan-note{display:flex;align-items:flex-start;gap:8px;background:rgba(255,204,0,0.07);
+  border:1px solid rgba(255,204,0,0.22);border-radius:8px;padding:9px 13px;
+  font-size:0.76rem;color:var(--yellow);line-height:1.55;margin-top:8px;}
+
 @media(max-width:600px){section{padding:1rem;}nav{display:none;}.hero h1{font-size:1.8rem;}}
 </style>
 </head>
@@ -420,6 +435,7 @@ section.active{display:block;}
       <label>Enter Website URL</label>
       <input type="text" id="url-input" placeholder="e.g. https://example.com"/>
     </div>
+    <div class="input-error" id="web-error"></div>
     <button class="scan-btn" id="web-btn" onclick="scanWebsite()">
       Scan Website Now
     </button>
@@ -427,7 +443,7 @@ section.active{display:block;}
       <div class="spin"></div>
       <div class="spin-text">Checking Google Safe Browsing... scanning VirusTotal... verifying domain...</div>
     </div>
-    <div class="result-box" id="web-result"></div>
+    <div class="result-stack" id="web-result"></div>
   </div>
 </section>
 
@@ -442,6 +458,7 @@ section.active{display:block;}
       <label>Paste Link or Message</label>
       <textarea id="link-input" placeholder="Paste the suspicious link or message here..."></textarea>
     </div>
+    <div class="input-error" id="link-error"></div>
     <button class="scan-btn" id="link-btn" onclick="scanLink()">
       Analyse for Threats
     </button>
@@ -449,7 +466,7 @@ section.active{display:block;}
       <div class="spin"></div>
       <div class="spin-text">Scanning Google Safe Browsing... checking VirusTotal engines...</div>
     </div>
-    <div class="result-box" id="link-result"></div>
+    <div class="result-stack" id="link-result"></div>
   </div>
 </section>
 
@@ -464,12 +481,13 @@ section.active{display:block;}
       <label>Enter News Headline or Claim</label>
       <textarea id="news-input" placeholder="e.g. Nigerian government to share N50,000 to all citizens..."></textarea>
     </div>
+    <div class="input-error" id="news-error"></div>
     <button class="scan-btn" id="news-btn" onclick="checkNews()">Verify with AI</button>
     <div class="spinner" id="news-spinner">
       <div class="spin"></div>
       <div class="spin-text">Cross-referencing sources... running AI analysis...</div>
     </div>
-    <div class="result-box" id="news-result"></div>
+    <div class="result-stack" id="news-result"></div>
     <div style="margin-top:2rem">
       <div class="panel-title" style="font-family:'Syne',sans-serif;font-size:1rem;font-weight:700;margin-bottom:1rem;color:var(--white)">Recent <span style="color:var(--cyan)">Verified Claims</span></div>
       <div class="news-card"><div class="news-score high">92%</div><div><div class="news-title">CBN announces new cashless policy update for 2025<span class="news-tag verified">VERIFIED</span></div><div class="news-meta">Source: CBN Official - businessday.ng - 3 hrs ago</div></div></div>
@@ -541,249 +559,514 @@ section.active{display:block;}
 </section>
 
 <script>
-var API_BASE = "https://rehoteqcheck-api.onrender.com"; var _v = "2.1";
+/* ============================================================
+   RehoCheck front-end logic — v2.2
+   Changes vs v2.1:
+     - every interpolated value is HTML-escaped (no DOM XSS)
+     - unavailable scanners produce an explicit "unknown" state
+       instead of a green "Safe" verdict (no more fail-open)
+     - Safe Browsing + VirusTotal run in parallel
+     - AbortController timeouts on every request
+     - VirusTotal analysis is polled (up to 3 attempts)
+     - every link in a pasted message is scanned (max 3)
+   ============================================================ */
 
+var DEFAULT_API_BASE = "https://rehoteqcheck-api.onrender.com";
 
+/* API base resolution:
+   1. ?api=<base> query param        (testing / local backend)
+   2. localStorage "rehocheck_api"
+   3. same origin, when the page is served by our own server
+   4. the hosted Render backend (default for the static deployment)   */
+var API_BASE = (function(){
+  try {
+    var q = new URLSearchParams(window.location.search).get("api");
+    if(q !== null) return q.replace(/\/+$/, "");
+  } catch(e) {}
+  try {
+    var stored = window.localStorage.getItem("rehocheck_api");
+    if(stored !== null) return stored.replace(/\/+$/, "");
+  } catch(e) {}
+  var h = window.location.hostname;
+  var local = window.location.protocol === "file:" ||
+              h === "localhost" || h === "127.0.0.1" ||
+              /\.e2b\.app$/.test(h);
+  return local ? "" : DEFAULT_API_BASE;
+})();
 
-function go(id,btn){
-  var secs=document.querySelectorAll("section");
-  for(var i=0;i<secs.length;i++) secs[i].classList.remove("active");
-  document.getElementById(id).classList.add("active");
-  var nbs=document.querySelectorAll(".nb");
-  for(var i=0;i<nbs.length;i++) nbs[i].classList.remove("active");
-  if(btn) btn.classList.add("active");
-  window.scrollTo({top:0,behavior:"smooth"});
+var REQUEST_TIMEOUT = 20000;
+
+/* ---------- utilities ---------- */
+
+function esc(value){
+  return String(value === null || value === undefined ? "" : value)
+    .replace(/[&<>"']/g, function(c){
+      return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];
+    });
 }
 
+function sleep(ms){
+  return new Promise(function(resolve){ setTimeout(resolve, ms); });
+}
+
+function showError(id, msg){
+  var el = document.getElementById(id);
+  if(!el) return;
+  if(msg){ el.textContent = msg; el.classList.add("show"); }
+  else { el.textContent = ""; el.classList.remove("show"); }
+}
+
+/* One JSON fetch helper: timeout + parsed error messages. */
+function api(path, opts, timeoutMs){
+  opts = opts || {};
+  var controller = new AbortController();
+  var timer = setTimeout(function(){ controller.abort(); }, timeoutMs || REQUEST_TIMEOUT);
+  var init = { method: opts.method || "GET", signal: controller.signal, headers: {} };
+  if(opts.body !== undefined){
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(opts.body);
+  }
+  return fetch(API_BASE + path, init)
+    .then(function(res){
+      return res.text().then(function(text){
+        var data = null;
+        if(text){
+          try { data = JSON.parse(text); } catch(e) { data = null; }
+        }
+        if(!res.ok){
+          var err = new Error((data && (data.error || data.message)) ||
+                              ("Service responded " + res.status));
+          err.status = res.status;
+          throw err;
+        }
+        return data;
+      });
+    })
+    .catch(function(err){
+      if(err && err.name === "AbortError") throw new Error("Request timed out");
+      throw err;
+    })
+    .finally(function(){ clearTimeout(timer); });
+}
+
+/* ---------- navigation ---------- */
+
+function go(id, btn){
+  var secs = document.querySelectorAll("section");
+  for(var i = 0; i < secs.length; i++) secs[i].classList.remove("active");
+  document.getElementById(id).classList.add("active");
+  var nbs = document.querySelectorAll(".nb");
+  for(var j = 0; j < nbs.length; j++) nbs[j].classList.remove("active");
+  if(btn) btn.classList.add("active");
+  window.scrollTo({top: 0, behavior: "smooth"});
+}
+
+/* ---------- input parsing ---------- */
+
+/* Returns every distinct web address found in a message (empty array if none). */
 function extractUrls(text){
-  var urlRegex = /(https?:\/\/[^\s]+)|(www\.[^\s]+)|([a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9]\.[a-zA-Z]{2,})/g;
-  var matches = text.match(urlRegex);
-  if(!matches) return [text];
-  return matches;
+  var urlRegex = /(https?:\/\/[^\s<>"']+)|(www\.[^\s<>"']+)|([a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}(?:\/[^\s<>"']*)?)/g;
+  var matches = text.match(urlRegex) || [];
+  var out = [];
+  for(var i = 0; i < matches.length; i++){
+    var u = normalizeUrl(matches[i]);
+    if(out.indexOf(u) === -1 && u.length <= 2000) out.push(u);
+  }
+  return out;
 }
 
 function normalizeUrl(url){
-  url = url.trim();
-  // Remove any spaces
-  url = url.replace(/\s/g, "");
-  // Add https if missing
-  if(!url.startsWith("http://") && !url.startsWith("https://"))
-    url = "https://" + url;
+  url = String(url).trim().replace(/\s/g, "");
+  if(!/^https?:\/\//i.test(url)) url = "https://" + url;
   return url;
 }
 
-function checkGoogleSafeBrowsing(url, callback){
-  fetch(API_BASE + "/api/safebrowsing", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({url: url})
-  })
-  .then(function(r){return r.json();})
-  .then(function(data){
-    console.log("Google Safe Browsing response:", JSON.stringify(data));
-    var isThreat = data.matches && data.matches.length > 0;
-    callback(null, isThreat, data.matches || []);
-  })
-  .catch(function(err){
-    console.log("Google Safe Browsing error:", err);
-    callback(err, false, []);
-  });
+function isPlausibleUrl(url){
+  return /^https?:\/\/[^\s/$.?#][^\s]*\.[^\s]{2,}/i.test(url) && url.length <= 2048;
 }
 
-function checkVirusTotal(url, callback){
-  fetch(API_BASE + "/api/virustotal", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({url: url})
-  })
-  .then(function(r){return r.json();})
-  .then(function(data){
-    if(data.data && data.data.id){
-      var id = data.data.id;
-      setTimeout(function(){
-        fetch(API_BASE + "/api/virustotal/analysis/" + id)
-        .then(function(r){return r.json();})
-        .then(function(res){callback(null,res);})
-        .catch(function(e){callback(e,null);});
-      }, 4000);
-    } else {
-      callback(null, data);
-    }
-  })
-  .catch(function(err){callback(err, null);});
+/* ---------- scanners ----------
+   Both helpers RESOLVE (never reject) with a result object carrying ok/error,
+   so the renderer can tell "checked and clean" apart from "could not check". */
+
+function checkGoogleSafeBrowsing(url){
+  return api("/api/safebrowsing", {method: "POST", body: {url: url}}, 25000)
+    .then(function(data){
+      var matches = (data && data.matches) || [];
+      return {ok: true, isThreat: matches.length > 0, matches: matches};
+    })
+    .catch(function(err){
+      console.warn("Google Safe Browsing unavailable:", err.message);
+      return {ok: false, isThreat: false, matches: [], error: err.message};
+    });
 }
 
-function buildResult(url, googleThreat, googleMatches, vtData){
-  var malicious = 0, suspicious = 0, harmless = 0, undetected = 0;
-  var vtStats = null;
+function checkVirusTotal(url){
+  var lastError = null;
 
-  if(vtData){
-    if(vtData.data && vtData.data.attributes){
-      var attrs = vtData.data.attributes;
-      vtStats = attrs.last_analysis_stats || attrs.stats || null;
-      if(vtStats){
-        malicious = vtStats.malicious || 0;
-        suspicious = vtStats.suspicious || 0;
-        harmless = vtStats.harmless || 0;
-        undetected = vtStats.undetected || 0;
+  function fetchReport(id){
+    return api("/api/virustotal/analysis/" + encodeURIComponent(id), {}, 20000);
+  }
+
+  function readStats(data){
+    var attrs = data && data.data && data.data.attributes;
+    var stats = attrs && (attrs.last_analysis_stats || attrs.stats);
+    return {stats: stats || null, status: attrs && attrs.status};
+  }
+
+  return api("/api/virustotal", {method: "POST", body: {url: url}}, 25000)
+    .then(function(submitted){
+      var id = submitted && submitted.data && submitted.data.id;
+      /* No analysis id => the backend answered with a cached report. */
+      if(!id){
+        var direct = readStats(submitted);
+        return {ok: true, stats: direct.stats, status: direct.status};
       }
-    }
-  }
 
-  var verdict = "safe";
-  if(googleThreat || malicious >= 3) verdict = "danger";
+      var attempt = 0;
+      function poll(){
+        attempt++;
+        return fetchReport(id)
+          .then(function(data){
+            var parsed = readStats(data);
+            var hasNumbers = parsed.stats &&
+              ((parsed.stats.malicious || 0) + (parsed.stats.suspicious || 0) +
+               (parsed.stats.harmless || 0) + (parsed.stats.undetected || 0)) > 0;
+            if(hasNumbers || attempt >= 3){
+              return {ok: true, stats: parsed.stats, status: parsed.status};
+            }
+            return sleep(3000).then(poll);
+          })
+          .catch(function(err){
+            lastError = err;
+            console.warn("VirusTotal poll " + attempt + " failed:", err.message);
+            if(attempt < 3) return sleep(3000).then(poll);
+            return {ok: false, stats: null, error: err.message};
+          });
+      }
+
+      /* VT needs a moment before engines report; then poll. */
+      return sleep(3500).then(poll);
+    })
+    .catch(function(err){
+      return {ok: false, stats: null, error: (lastError && lastError.message) || err.message};
+    });
+}
+
+/* ---------- result rendering ---------- */
+
+function row(label, valueHtml, cls){
+  return "<div class='detail-row'><span class='detail-label'>" + esc(label) +
+         "</span><span class='detail-val " + cls + "'>" + valueHtml + "</span></div>";
+}
+
+function buildResult(url, gsb, vt){
+  var stats = (vt && vt.ok && vt.stats) ? vt.stats : null;
+  var malicious  = stats ? (stats.malicious  || 0) : 0;
+  var suspicious = stats ? (stats.suspicious || 0) : 0;
+  var harmless   = stats ? (stats.harmless   || 0) : 0;
+  var undetected = stats ? (stats.undetected || 0) : 0;
+  var engines    = malicious + suspicious + harmless + undetected;
+
+  var googleOk = !!(gsb && gsb.ok);
+  var vtOk     = !!(vt && vt.ok);
+  var noData   = !googleOk && !vtOk;
+  var partial  = !noData && !(googleOk && vtOk);
+
+  var verdict;
+  if(noData) verdict = "unknown";
+  else if(googleOk && gsb.isThreat) verdict = "danger";
+  else if(malicious >= 3) verdict = "danger";
   else if(malicious >= 1 || suspicious >= 3) verdict = "warning";
+  else if(partial && !googleOk && !stats) verdict = "unknown";
+  else verdict = "safe";
 
-  var score = verdict === "safe" ? Math.min(95, 70 + harmless) : verdict === "warning" ? 35 : 8;
-  if(score > 99) score = 99;
+  var score;
+  if(verdict === "unknown") score = null;
+  else if(verdict === "danger") score = 8;
+  else if(verdict === "warning") score = 35;
+  else score = partial ? Math.min(85, 55 + harmless) : Math.min(95, 70 + harmless);
 
-  var threatType = "";
-  if(googleMatches && googleMatches.length > 0){
-    threatType = googleMatches[0].threatType || "";
-  }
+  var meta = {
+    safe:    {cls: "safe",    icon: "&#10003;", title: "This URL Appears Safe"},
+    warning: {cls: "warning", icon: "&#9888;",  title: "Suspicious URL Detected"},
+    danger:  {cls: "danger",  icon: "&#9888;",  title: "DANGEROUS URL - Do Not Visit!"},
+    unknown: {cls: "unknown", icon: "&#9432;",  title: "Could Not Complete the Scan"}
+  }[verdict];
 
-  var icons = {safe:"OK",warning:"WARN",danger:"ALERT"};
-  var titles = {
-    safe:"This URL Appears Safe",
-    warning:"Suspicious URL Detected",
-    danger:"DANGEROUS URL - Do Not Visit!"
-  };
+  var fill = verdict === "safe" ? "linear-gradient(90deg,var(--green2),var(--green))"
+           : verdict === "warning" ? "linear-gradient(90deg,#cc9900,var(--yellow))"
+           : verdict === "danger" ? "linear-gradient(90deg,#aa2222,var(--red))"
+           : "linear-gradient(90deg,#665500,var(--yellow))";
 
+  /* --- detail rows --- */
   var details = "";
 
-  // Google result
-  if(googleThreat){
-    details += "<div class='detail-row'><span class='detail-label'>Google Safe Browsing</span><span class='detail-val bad'>THREAT DETECTED - " + threatType + "</span></div>";
+  if(googleOk){
+    if(gsb.isThreat){
+      var match = (gsb.matches && gsb.matches[0]) || {};
+      var threatType = match.threatType || (match.threat && match.threat.threatType) || "UNKNOWN";
+      details += row("Google Safe Browsing", "THREAT DETECTED &mdash; " + esc(threatType), "bad");
+    } else {
+      details += row("Google Safe Browsing", "No threats found", "good");
+    }
   } else {
-    details += "<div class='detail-row'><span class='detail-label'>Google Safe Browsing</span><span class='detail-val good'>No Threats Found</span></div>";
+    details += row("Google Safe Browsing", "Unavailable &mdash; " + esc((gsb && gsb.error) || "no response"), "warn");
   }
 
-  // VirusTotal result
-  if(vtStats){
-    details += "<div class='detail-row'><span class='detail-label'>Malicious Engines</span><span class='detail-val " + (malicious>0?"bad":"good") + "'>" + malicious + " / " + (malicious+suspicious+harmless+undetected) + " engines</span></div>";
-    details += "<div class='detail-row'><span class='detail-label'>Suspicious Engines</span><span class='detail-val " + (suspicious>0?"warn":"good") + "'>" + suspicious + " engines flagged</span></div>";
-    details += "<div class='detail-row'><span class='detail-label'>Clean Engines</span><span class='detail-val good'>" + harmless + " engines clean</span></div>";
+  if(stats){
+    details += row("Malicious Engines",
+      malicious + " / " + engines + " engines", malicious > 0 ? "bad" : "good");
+    details += row("Suspicious Engines",
+      suspicious + " engines flagged", suspicious > 0 ? "warn" : "good");
+    details += row("Clean Engines", harmless + " engines clean", "good");
+  } else if(vtOk){
+    details += row("VirusTotal Scan", "Still processing &mdash; no engine data yet", "warn");
   } else {
-    details += "<div class='detail-row'><span class='detail-label'>VirusTotal Scan</span><span class='detail-val neutral'>Analysis complete</span></div>";
+    details += row("VirusTotal Scan", "Unavailable &mdash; " + esc((vt && vt.error) || "no response"), "warn");
   }
 
-  details += "<div class='detail-row'><span class='detail-label'>Overall Verdict</span><span class='detail-val " + (verdict==="safe"?"good":verdict==="warning"?"warn":"bad") + "'>" + verdict.toUpperCase() + "</span></div>";
+  details += row("Overall Verdict",
+    verdict === "unknown" ? "NOT CHECKED" : verdict.toUpperCase(),
+    verdict === "safe" ? "good" : verdict === "warning" ? "warn" : verdict === "danger" ? "bad" : "warn");
 
-  var html = "";
-  html += "<div class='result-top'><div class='result-icon " + verdict + "'>" + (verdict==="safe"?"&#10003;":verdict==="warning"?"&#9888;":"&#9888;") + "</div>";
-  html += "<div><div class='result-title " + verdict + "'>" + titles[verdict] + "</div>";
-  html += "<div class='result-sub'>" + url + "</div></div></div>";
-  html += "<div class='score-section'><div class='score-label'><span>Trust Score</span><span>" + score + "/100</span></div>";
-  html += "<div class='score-bar'><div class='score-fill' style='width:" + score + "%'></div></div></div>";
-  html += "<div class='result-details'>" + details;
-  html += "<div class='api-note'><b>Powered by:</b> Google Safe Browsing API + VirusTotal (70+ scan engines) - Real-time detection</div>";
-  html += "</div>";
-  return html;
+  /* --- honesty banner --- */
+  var note = "";
+  if(noData){
+    note = "<div class='scan-note'>Neither scanner could be reached. This is <b>not</b> a clean " +
+           "result &mdash; treat the link as unverified and try again shortly.</div>";
+  } else if(partial){
+    note = "<div class='scan-note'>Partial check only: " +
+           (googleOk ? "VirusTotal" : "Google Safe Browsing") +
+           " was unavailable, so this verdict covers one source instead of two.</div>";
+  }
+
+  var scoreLabel = score === null ? "n/a" : score + "/100";
+  var scoreWidth = score === null ? 0 : score;
+
+  return "<div class='result-box'>" +
+      "<div class='result-top'>" +
+        "<div class='result-icon " + meta.cls + "'>" + meta.icon + "</div>" +
+        "<div><div class='result-title " + meta.cls + "'>" + meta.title + "</div>" +
+        "<div class='result-sub'>" + esc(url) + "</div></div>" +
+      "</div>" +
+      "<div class='score-section'>" +
+        "<div class='score-label'><span>Trust Score</span><span>" + scoreLabel + "</span></div>" +
+        "<div class='score-bar'><div class='score-fill' style='width:" + scoreWidth +
+          "%;background:" + fill + "'></div></div>" +
+      "</div>" +
+      "<div class='result-details'>" + details + note +
+        "<div class='api-note'><b>Powered by:</b> Google Safe Browsing API + VirusTotal " +
+        "(70+ scan engines) &mdash; real-time detection</div>" +
+      "</div>" +
+    "</div>";
 }
+
+/* ---------- website scanner ---------- */
 
 function scanWebsite(){
-  var raw = document.getElementById("url-input").value.trim();
-  if(!raw){alert("Please enter a website URL");return;}
+  var raw   = document.getElementById("url-input").value.trim();
+  var btn   = document.getElementById("web-btn");
+  var rb    = document.getElementById("web-result");
+  var spin  = document.getElementById("web-spinner");
+
+  showError("web-error", "");
+  if(!raw){ showError("web-error", "Please enter a website URL to scan."); return; }
+
   var url = normalizeUrl(raw);
-  var rb = document.getElementById("web-result");
-  var btn = document.getElementById("web-btn");
-  rb.style.display = "none";
-  document.getElementById("web-spinner").style.display = "block";
+  if(!isPlausibleUrl(url)){
+    showError("web-error", "That doesn't look like a web address. Example: https://example.com");
+    return;
+  }
+
+  rb.classList.remove("show");
+  rb.innerHTML = "";
+  spin.style.display = "block";
   btn.disabled = true;
 
-  checkGoogleSafeBrowsing(url, function(err1, isThreat, matches){
-    checkVirusTotal(url, function(err2, vtData){
-      document.getElementById("web-spinner").style.display = "none";
+  Promise.all([checkGoogleSafeBrowsing(url), checkVirusTotal(url)])
+    .then(function(results){
+      rb.innerHTML = buildResult(url, results[0], results[1]);
+      rb.classList.add("show");
+    })
+    .catch(function(err){
+      showError("web-error", "Scan failed: " + esc(err && err.message ? err.message : "unknown error"));
+    })
+    .finally(function(){
+      spin.style.display = "none";
       btn.disabled = false;
-      rb.innerHTML = buildResult(url, isThreat, matches, vtData);
-      rb.style.display = "block";
     });
-  });
 }
+
+/* ---------- link / message scanner ---------- */
+
+var MAX_LINKS = 3;
 
 function scanLink(){
-  var raw = document.getElementById("link-input").value.trim();
-  if(!raw){alert("Please paste a link or message");return;}
-  var urls = extractUrls(raw);
-  var url = normalizeUrl(urls[0]);
-  var rb = document.getElementById("link-result");
-  var btn = document.getElementById("link-btn");
-  rb.style.display = "none";
-  document.getElementById("link-spinner").style.display = "block";
+  var raw  = document.getElementById("link-input").value.trim();
+  var btn  = document.getElementById("link-btn");
+  var rb   = document.getElementById("link-result");
+  var spin = document.getElementById("link-spinner");
+
+  showError("link-error", "");
+  if(!raw){ showError("link-error", "Please paste a link or a message that contains one."); return; }
+
+  var urls = extractUrls(raw).filter(isPlausibleUrl);
+  if(!urls.length){
+    showError("link-error", "No web address found in that text. Paste a message that contains a " +
+      "link (https://example.com, bit.ly/xyz, or example.com).");
+    return;
+  }
+
+  var extra = urls.length > MAX_LINKS ? urls.length - MAX_LINKS : 0;
+  var targets = urls.slice(0, MAX_LINKS);
+
+  rb.classList.remove("show");
+  rb.innerHTML = "";
+  spin.style.display = "block";
   btn.disabled = true;
 
-  checkGoogleSafeBrowsing(url, function(err1, isThreat, matches){
-    checkVirusTotal(url, function(err2, vtData){
-      document.getElementById("link-spinner").style.display = "none";
+  Promise.all(targets.map(function(u){
+    return Promise.all([checkGoogleSafeBrowsing(u), checkVirusTotal(u)])
+      .then(function(r){ return {url: u, gsb: r[0], vt: r[1]}; });
+  }))
+    .then(function(res){
+      var html = "";
+      if(targets.length > 1){
+        html += "<div class='scan-note'>" + targets.length +
+                " links found in that message &mdash; each one is scanned below.</div>";
+      }
+      if(extra){
+        html += "<div class='scan-note'>" + extra + " further link(s) were ignored. " +
+                "Scan them one at a time for a full report.</div>";
+      }
+      html += res.map(function(r){ return buildResult(r.url, r.gsb, r.vt); }).join("");
+      rb.innerHTML = html;
+      rb.classList.add("show");
+    })
+    .catch(function(err){
+      showError("link-error", "Scan failed: " + esc(err && err.message ? err.message : "unknown error"));
+    })
+    .finally(function(){
+      spin.style.display = "none";
       btn.disabled = false;
-      rb.innerHTML = buildResult(url, isThreat, matches, vtData);
-      rb.style.display = "block";
     });
-  });
 }
+
+/* ---------- news verification ---------- */
 
 function checkNews(){
-  var txt = document.getElementById("news-input").value.trim();
-  if(!txt){alert("Please enter a news headline or claim");return;}
-  var rb = document.getElementById("news-result");
-  var btn = document.getElementById("news-btn");
-  rb.style.display = "none";
-  document.getElementById("news-spinner").style.display = "block";
-  if(btn) btn.disabled = true;
+  var txt  = document.getElementById("news-input").value.trim();
+  var btn  = document.getElementById("news-btn");
+  var rb   = document.getElementById("news-result");
+  var spin = document.getElementById("news-spinner");
 
-  fetch(API_BASE + "/api/verify-news", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({headline: txt})
-  })
-  .then(function(r){return r.json();})
-  .then(function(data){
-    document.getElementById("news-spinner").style.display = "none";
-    if(btn) btn.disabled = false;
+  showError("news-error", "");
+  if(txt.length < 5){
+    showError("news-error", "Please enter the headline or claim you want checked (at least 5 characters).");
+    return;
+  }
+  if(txt.length > 800){
+    showError("news-error", "That is too long for one check &mdash; keep it under 800 characters.");
+    return;
+  }
 
-    if(data.error){
-      rb.innerHTML = "<div class='result-top'><div class='result-icon warning'>&#9888;</div><div><div class='result-title warning'>Could not verify at this time</div><div class='result-sub'>Please try again shortly</div></div></div>";
-      rb.style.display = "block";
-      return;
-    }
+  rb.classList.remove("show");
+  rb.innerHTML = "";
+  spin.style.display = "block";
+  btn.disabled = true;
 
-    var verdict = data.verdict || "UNVERIFIABLE";
-    var score = data.credibility_score || 50;
-    var misinfoScore = data.misinformation_score || 50;
-    var summary = data.summary || "";
-    var sourcesNote = data.sources_note || "";
-    var warning = data.warning || "";
+  api("/api/verify-news", {method: "POST", body: {headline: txt}}, 45000)
+    .then(function(data){
+      if(!data || data.error){
+        rb.innerHTML =
+          "<div class='result-box'><div class='result-top'>" +
+          "<div class='result-icon unknown'>&#9432;</div><div>" +
+          "<div class='result-title unknown'>Could not verify at this time</div>" +
+          "<div class='result-sub'>The verification service is unavailable &mdash; please try again shortly</div>" +
+          "</div></div></div>";
+        rb.classList.add("show");
+        return;
+      }
 
-    var cssVerdict = "warning";
-    var icon = "&#9432;";
-    var title = "Unverified Claim";
-    if(verdict === "TRUE"){cssVerdict="safe";icon="&#10003;";title="Claim Appears TRUE";}
-    else if(verdict === "FALSE"){cssVerdict="danger";icon="&#9888;";title="Claim Appears FALSE";}
-    else if(verdict === "MISLEADING"){cssVerdict="warning";icon="&#9888;";title="Claim is MISLEADING";}
-    else if(verdict === "UNVERIFIABLE"){cssVerdict="warning";icon="&#9432;";title="Cannot Be Verified";}
+      var verdict      = data.verdict || "UNVERIFIABLE";
+      var score        = typeof data.credibility_score === "number" ? data.credibility_score : 50;
+      var misinfoScore = typeof data.misinformation_score === "number" ? data.misinformation_score : 50;
+      var summary      = data.summary || "";
+      var sourcesNote  = data.sources_note || "";
+      var warning      = data.warning || "";
 
-    var details = "";
-    details += "<div class='detail-row'><span class='detail-label'>AI Verdict</span><span class='detail-val "+(cssVerdict==="safe"?"good":cssVerdict==="danger"?"bad":"warn")+"'>"+verdict+"</span></div>";
-    details += "<div class='detail-row'><span class='detail-label'>Credibility Score</span><span class='detail-val "+(score>=60?"good":score>=40?"warn":"bad")+"'>"+score+"/100</span></div>";
-    details += "<div class='detail-row'><span class='detail-label'>Misinformation Risk</span><span class='detail-val "+(misinfoScore<=30?"good":misinfoScore<=60?"warn":"bad")+"'>"+misinfoScore+"%</span></div>";
-    if(summary) details += "<div class='detail-row' style='flex-direction:column;gap:4px;'><span class='detail-label'>Analysis</span><span class='detail-val neutral' style='font-family:inherit;font-size:0.8rem;line-height:1.6;white-space:normal;'>"+summary+"</span></div>";
-    if(sourcesNote) details += "<div class='detail-row' style='flex-direction:column;gap:4px;'><span class='detail-label'>Sources Note</span><span class='detail-val neutral' style='font-family:inherit;font-size:0.78rem;line-height:1.6;white-space:normal;'>"+sourcesNote+"</span></div>";
-    if(warning) details += "<div class='detail-row' style='flex-direction:column;gap:4px;'><span class='detail-label'>Warning</span><span class='detail-val bad' style='font-family:inherit;font-size:0.78rem;line-height:1.6;white-space:normal;'>"+warning+"</span></div>";
-    details += "<div class='api-note'><b>Powered by:</b> Claude AI (Anthropic) - Real AI-powered fact analysis</div>";
+      var cssVerdict = "warning", icon = "&#9432;", title = "Unverified Claim";
+      if(verdict === "TRUE"){ cssVerdict = "safe";    icon = "&#10003;"; title = "Claim Appears TRUE"; }
+      else if(verdict === "FALSE"){ cssVerdict = "danger"; icon = "&#9888;"; title = "Claim Appears FALSE"; }
+      else if(verdict === "MISLEADING"){ cssVerdict = "warning"; icon = "&#9888;"; title = "Claim is MISLEADING"; }
+      else if(verdict === "UNVERIFIABLE"){ cssVerdict = "warning"; icon = "&#9432;"; title = "Cannot Be Verified"; }
 
-    rb.innerHTML = "<div class='result-top'><div class='result-icon "+cssVerdict+"'>"+icon+"</div><div><div class='result-title "+cssVerdict+"'>"+title+"</div><div class='result-sub'>Claude AI analysis complete</div></div></div>"
-      +"<div class='score-section'><div class='score-label'><span>Credibility Score</span><span>"+score+"/100</span></div><div class='score-bar'><div class='score-fill' style='width:"+score+"%'></div></div></div>"
-      +"<div class='result-details'>"+details+"</div>";
-    rb.style.display = "block";
-  })
-  .catch(function(err){
-    document.getElementById("news-spinner").style.display = "none";
-    if(btn) btn.disabled = false;
-    console.log("News verify error:", err);
-    rb.innerHTML = "<div class='result-top'><div class='result-icon warning'>&#9888;</div><div><div class='result-title warning'>Connection error</div><div class='result-sub'>Please check your internet and try again</div></div></div>";
-    rb.style.display = "block";
-  });
+      var details = "";
+      details += row("AI Verdict", esc(verdict),
+        cssVerdict === "safe" ? "good" : cssVerdict === "danger" ? "bad" : "warn");
+      details += row("Credibility Score",
+        esc(score) + "/100", score >= 60 ? "good" : score >= 40 ? "warn" : "bad");
+      details += row("Misinformation Risk",
+        esc(misinfoScore) + "%", misinfoScore <= 30 ? "good" : misinfoScore <= 60 ? "warn" : "bad");
+
+      if(summary){
+        details += "<div class='detail-row' style='flex-direction:column;gap:4px;'>" +
+          "<span class='detail-label'>Analysis</span>" +
+          "<span class='detail-val neutral' style='font-family:inherit;font-size:0.8rem;" +
+          "line-height:1.6;white-space:normal;'>" + esc(summary) + "</span></div>";
+      }
+      if(sourcesNote){
+        details += "<div class='detail-row' style='flex-direction:column;gap:4px;'>" +
+          "<span class='detail-label'>Sources Note</span>" +
+          "<span class='detail-val neutral' style='font-family:inherit;font-size:0.78rem;" +
+          "line-height:1.6;white-space:normal;'>" + esc(sourcesNote) + "</span></div>";
+      }
+      if(warning){
+        details += "<div class='detail-row' style='flex-direction:column;gap:4px;'>" +
+          "<span class='detail-label'>Warning</span>" +
+          "<span class='detail-val bad' style='font-family:inherit;font-size:0.78rem;" +
+          "line-height:1.6;white-space:normal;'>" + esc(warning) + "</span></div>";
+      }
+
+      var fill = cssVerdict === "safe" ? "linear-gradient(90deg,var(--green2),var(--green))"
+               : cssVerdict === "danger" ? "linear-gradient(90deg,#aa2222,var(--red))"
+               : "linear-gradient(90deg,#cc9900,var(--yellow))";
+
+      rb.innerHTML = "<div class='result-box'>" +
+          "<div class='result-top'><div class='result-icon " + cssVerdict + "'>" + icon + "</div>" +
+          "<div><div class='result-title " + cssVerdict + "'>" + title + "</div>" +
+          "<div class='result-sub'>Claude AI analysis complete</div></div></div>" +
+          "<div class='score-section'>" +
+            "<div class='score-label'><span>Credibility Score</span><span>" +
+              esc(score) + "/100</span></div>" +
+            "<div class='score-bar'><div class='score-fill' style='width:" + esc(score) +
+              "%;background:" + fill + "'></div></div>" +
+          "</div>" +
+          "<div class='result-details'>" + details +
+            "<div class='api-note'><b>Powered by:</b> Claude AI (Anthropic) &mdash; " +
+            "AI-assisted fact analysis, not a final legal or editorial ruling.</div>" +
+          "</div></div>";
+      rb.classList.add("show");
+    })
+    .catch(function(err){
+      console.warn("News verify error:", err.message);
+      showError("news-error", "Connection error &mdash; please check your internet and try again.");
+    })
+    .finally(function(){
+      spin.style.display = "none";
+      btn.disabled = false;
+    });
 }
+
+/* Enter key submits the active scanner. */
+document.addEventListener("keydown", function(e){
+  if(e.key !== "Enter") return;
+  var active = document.querySelector("section.active");
+  if(!active) return;
+  if(active.id === "website"){ e.preventDefault(); scanWebsite(); }
+  else if(active.id === "news" && e.target.id === "news-input" && (e.ctrlKey || e.metaKey)){ checkNews(); }
+});
 </script>
 </body>
 </html>
